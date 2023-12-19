@@ -3415,6 +3415,55 @@ recv_init_crash_recovery_spaces(bool rescan, bool& missing_tablespace)
 	return DB_SUCCESS;
 }
 
+dberr_t
+recv_recovery_read_max_checkpoint()
+{
+  ulint		max_cp_field;
+  dberr_t	err = DB_SUCCESS;
+
+  ut_ad(srv_operation <= SRV_OPERATION_EXPORT_RESTORED
+        || srv_operation == SRV_OPERATION_RESTORE
+        || srv_operation == SRV_OPERATION_RESTORE_EXPORT);
+  ut_d(mysql_mutex_lock(&buf_pool.flush_list_mutex));
+  ut_ad(UT_LIST_GET_LEN(buf_pool.LRU) == 0);
+  ut_ad(UT_LIST_GET_LEN(buf_pool.unzip_LRU) == 0);
+  ut_d(mysql_mutex_unlock(&buf_pool.flush_list_mutex));
+
+  if (srv_force_recovery >= SRV_FORCE_NO_LOG_REDO)
+  {
+    ib::info() << "innodb_force_recovery=6 skips redo log apply";
+    return DB_SUCCESS;
+  }
+
+  mysql_mutex_lock(&log_sys.mutex);
+
+  err= recv_find_max_checkpoint(&max_cp_field);
+
+  if (err != DB_SUCCESS)
+  {
+     recv_sys.recovered_lsn = log_sys.get_lsn();
+     mysql_mutex_unlock(&log_sys.mutex);
+     return err;
+  }
+
+  byte* buf= log_sys.checkpoint_buf;
+  if ((err= log_sys.log.read(max_cp_field,
+		{buf, OS_FILE_LOG_BLOCK_SIZE})))
+  {
+    mysql_mutex_unlock(&log_sys.mutex);
+    return err;
+  }
+
+  log_sys.next_checkpoint_no= mach_read_from_8(
+				buf + LOG_CHECKPOINT_NO);
+  log_sys.next_checkpoint_lsn= mach_read_from_8(
+				buf + LOG_CHECKPOINT_LSN);
+  recv_sys.mlog_checkpoint_lsn= mach_read_from_8(
+				buf + LOG_CHECKPOINT_END_LSN);
+  mysql_mutex_unlock(&log_sys.mutex);
+  return err;
+}
+
 /** Start recovering from a redo log checkpoint.
 @param[in]	flush_lsn	FIL_PAGE_FILE_FLUSH_LSN
 of first system tablespace page
@@ -3422,12 +3471,8 @@ of first system tablespace page
 dberr_t
 recv_recovery_from_checkpoint_start(lsn_t flush_lsn)
 {
-	ulint		max_cp_field;
-	lsn_t		checkpoint_lsn;
 	bool		rescan = false;
-	ib_uint64_t	checkpoint_no;
 	lsn_t		contiguous_lsn;
-	byte*		buf;
 	dberr_t		err = DB_SUCCESS;
 
 	ut_ad(srv_operation <= SRV_OPERATION_EXPORT_RESTORED
@@ -3445,27 +3490,11 @@ recv_recovery_from_checkpoint_start(lsn_t flush_lsn)
 		return(DB_SUCCESS);
 	}
 
-	recv_sys.recovery_on = true;
-
 	mysql_mutex_lock(&log_sys.mutex);
-
-	err = recv_find_max_checkpoint(&max_cp_field);
-
-	if (err != DB_SUCCESS) {
-
-		recv_sys.recovered_lsn = log_sys.get_lsn();
-		mysql_mutex_unlock(&log_sys.mutex);
-		return(err);
-	}
-
-	buf = log_sys.checkpoint_buf;
-	if ((err= log_sys.log.read(max_cp_field, {buf, OS_FILE_LOG_BLOCK_SIZE}))) {
-		mysql_mutex_unlock(&log_sys.mutex);
-		return(err);
-	}
-
-	checkpoint_lsn = mach_read_from_8(buf + LOG_CHECKPOINT_LSN);
-	checkpoint_no = mach_read_from_8(buf + LOG_CHECKPOINT_NO);
+	ib_uint64_t checkpoint_no= log_sys.next_checkpoint_no;
+	lsn_t checkpoint_lsn= log_sys.next_checkpoint_lsn;
+	const lsn_t end_lsn= recv_sys.mlog_checkpoint_lsn;
+	recv_sys.recovery_on = true;
 
 	/* Start reading the log from the checkpoint lsn. The variable
 	contiguous_lsn contains an lsn up to which the log is known to
@@ -3474,8 +3503,6 @@ recv_recovery_from_checkpoint_start(lsn_t flush_lsn)
 
 	ut_ad(RECV_SCAN_SIZE <= srv_log_buffer_size);
 
-	const lsn_t	end_lsn = mach_read_from_8(
-		buf + LOG_CHECKPOINT_END_LSN);
 
 	ut_ad(recv_sys.pages.empty());
 	contiguous_lsn = checkpoint_lsn;
@@ -3843,6 +3870,46 @@ byte *recv_dblwr_t::find_page(const page_id_t page_id,
   }
 
   return result;
+}
+
+uint32_t recv_dblwr_t::find_first_page(const char* name, os_file_t file)
+{
+  uint32_t space= 0;
+  os_offset_t file_size= os_file_get_size(file);
+  if (file_size == (os_offset_t) -1) return space;
+  for (const page_t *page : pages)
+  {
+    uint32_t space_id= page_get_space_id(page);
+    if (page_get_page_no(page) > 0 || space_id == 0)
+next_page:
+      continue;
+    uint32_t flags= mach_read_from_4(
+      FSP_HEADER_OFFSET + FSP_SPACE_FLAGS + page);
+    page_id_t page_id(space_id, 0);
+    size_t page_size= fil_space_t::physical_size(flags);
+    if (file_size < 4 * page_size) goto next_page;
+    byte *read_page= static_cast<byte*>(
+      aligned_malloc(page_size, page_size));
+    /** Read 3 pages from the file and match the space id
+    with the space id which is stored in
+    doublewrite buffer page. */
+    for (ulint j= 1; j <= 3; j++)
+    {
+      if (os_file_read(IORequestRead, file, read_page,
+                       j * page_size, page_size) != DB_SUCCESS)
+        goto next_page;
+      if (buf_page_is_corrupted(false, read_page, flags) ||
+          memcmp(read_page + FIL_PAGE_SPACE_ID,
+                 page + FIL_PAGE_SPACE_ID, 4))
+	goto next_page;
+    }
+    space= space_id;
+    break;
+  }
+
+  if (space && !restore_first_page(space, name, file))
+    return space;
+  return 0;
 }
 
 bool recv_dblwr_t::restore_first_page(ulint space_id, const char *name,

@@ -235,8 +235,10 @@ innodb_file_per_table. If we are in a crash recovery, this function
 loads the pages from double write buffer into memory.
 @param file File handle
 @param path Path name of file
+@param checkpoint_lsn checkpoint lsn
 @return DB_SUCCESS or error code */
-dberr_t buf_dblwr_t::init_or_load_pages(pfs_os_file_t file, const char *path)
+dberr_t buf_dblwr_t::init_or_load_pages(
+	pfs_os_file_t file, const char *path, lsn_t checkpoint_lsn)
 {
   ut_ad(this == &buf_dblwr);
   const uint32_t size= block_size();
@@ -325,7 +327,8 @@ func_exit:
   }
   else
     for (ulint i= 0; i < size * 2; i++, page += srv_page_size)
-      if (mach_read_from_8(my_assume_aligned<8>(page + FIL_PAGE_LSN)))
+      if (mach_read_from_8(my_assume_aligned<8>(page + FIL_PAGE_LSN))
+          > checkpoint_lsn)
         /* Each valid page header must contain a nonzero FIL_PAGE_LSN field. */
         recv_sys.dblwr.add(page);
 

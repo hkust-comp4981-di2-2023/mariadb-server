@@ -522,6 +522,7 @@ public:
     /** closes log file */
     void close_file();
 
+    bool is_open() { return fd.is_opened(); }
     /** @return whether the redo log is encrypted */
     bool is_encrypted() const { return format & FORMAT_ENCRYPTED; }
     /** @return whether the redo log is in the physical format */

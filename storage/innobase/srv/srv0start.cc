@@ -297,9 +297,6 @@ static dberr_t create_log_file(bool create_new_db, lsn_t lsn,
 	log_sys.log.create();
 
 	log_sys.log.open_file(logfile0);
-	if (!fil_system.sys_space->open(create_new_db)) {
-		return DB_ERROR;
-	}
 
 	/* Create a log checkpoint. */
 	mysql_mutex_lock(&log_sys.mutex);
@@ -1270,12 +1267,61 @@ dberr_t srv_start(bool create_new_db)
 
 	/* Check if undo tablespaces and redo log files exist before creating
 	a new system tablespace */
+	srv_log_file_size_requested = srv_log_file_size;
+
+	if (innodb_encrypt_temporary_tables && !log_crypt_init()) {
+		return srv_init_abort(DB_ERROR);
+	}
+
+	std::string logfile0;
+	bool create_new_log = create_new_db;
 	if (create_new_db) {
 		err = srv_check_undo_redo_logs_exists();
 		if (err != DB_SUCCESS) {
 			return(srv_init_abort(DB_ERROR));
 		}
 		recv_sys.debug_free();
+		flushed_lsn = log_sys.get_lsn();
+		log_sys.set_flushed_lsn(flushed_lsn);
+
+		err = create_log_file(true, flushed_lsn, logfile0);
+
+		if (err != DB_SUCCESS) {
+			return(srv_init_abort(err));
+		}
+	} else {
+		srv_log_file_size = 0;
+
+		bool log_file_found;
+		if (dberr_t err = find_and_check_log_file(log_file_found)) {
+			if (err == DB_NOT_FOUND) {
+				return DB_SUCCESS;
+			}
+			return srv_init_abort(err);
+		}
+
+		create_new_log = srv_log_file_size == 0;
+		if (!create_new_log) {
+			srv_log_file_found = log_file_found;
+
+			log_sys.log.open_file(get_log_file_path());
+
+			log_sys.log.create();
+
+			if (!log_set_capacity(
+				srv_log_file_size_requested)) {
+				return(srv_init_abort(DB_ERROR));
+			}
+
+			/* Enable checkpoints in the page cleaner. */
+			recv_sys.recovery_on = false;
+
+			err= recv_recovery_read_max_checkpoint();
+
+			if (err != DB_SUCCESS) {
+				return srv_init_abort(err);
+			}
+		}
 	}
 
 	/* Open or create the data files. */
@@ -1304,82 +1350,31 @@ dberr_t srv_start(bool create_new_db)
 		return(srv_init_abort(err));
 	}
 
-	srv_log_file_size_requested = srv_log_file_size;
+	if (!create_new_db && create_new_log) {
+		if (flushed_lsn < lsn_t(1000)) {
+			ib::error()
+				<< "Cannot create log file because"
+				" data files are corrupt or the"
+				" database was not shut down cleanly"
+				" after creating the data files.";
+			return srv_init_abort(DB_ERROR);
+		}
 
-	if (innodb_encrypt_temporary_tables && !log_crypt_init()) {
-		return srv_init_abort(DB_ERROR);
-	}
+		srv_log_file_size = srv_log_file_size_requested;
 
-	std::string logfile0;
-	bool create_new_log = create_new_db;
-	if (create_new_db) {
-		flushed_lsn = log_sys.get_lsn();
-		log_sys.set_flushed_lsn(flushed_lsn);
-
-		err = create_log_file(true, flushed_lsn, logfile0);
+		err = create_log_file(false, flushed_lsn, logfile0);
+		if (err == DB_SUCCESS) {
+			err = create_log_file_rename(flushed_lsn, logfile0);
+		}
 
 		if (err != DB_SUCCESS) {
-			for (Tablespace::const_iterator
-			       i = srv_sys_space.begin();
-			     i != srv_sys_space.end(); i++) {
-				os_file_delete(innodb_data_file_key,
-					       i->filepath());
-			}
 			return(srv_init_abort(err));
 		}
-	} else {
-		srv_log_file_size = 0;
 
-		bool log_file_found;
-		if (dberr_t err = find_and_check_log_file(log_file_found)) {
-			if (err == DB_NOT_FOUND) {
-				return DB_SUCCESS;
-			}
-			return srv_init_abort(err);
-		}
-
-		create_new_log = srv_log_file_size == 0;
-		if (create_new_log) {
-			if (flushed_lsn < lsn_t(1000)) {
-				ib::error()
-					<< "Cannot create log file because"
-					" data files are corrupt or the"
-					" database was not shut down cleanly"
-					" after creating the data files.";
-				return srv_init_abort(DB_ERROR);
-			}
-
-			srv_log_file_size = srv_log_file_size_requested;
-
-			err = create_log_file(false, flushed_lsn, logfile0);
-
-			if (err == DB_SUCCESS) {
-				err = create_log_file_rename(flushed_lsn,
-							     logfile0);
-			}
-
-			if (err != DB_SUCCESS) {
-				return(srv_init_abort(err));
-			}
-
-			/* Suppress the message about
-			crash recovery. */
-			flushed_lsn = log_sys.get_lsn();
-			goto file_checked;
-		}
-
-		srv_log_file_found = log_file_found;
-
-		log_sys.log.open_file(get_log_file_path());
-
-		log_sys.log.create();
-
-		if (!log_set_capacity(srv_log_file_size_requested)) {
-			return(srv_init_abort(DB_ERROR));
-		}
-
-		/* Enable checkpoints in the page cleaner. */
-		recv_sys.recovery_on = false;
+		/* Suppress the message about
+		crash recovery. */
+		flushed_lsn = log_sys.get_lsn();
+		goto file_checked;
 	}
 
 file_checked:

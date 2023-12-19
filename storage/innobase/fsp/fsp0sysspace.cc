@@ -583,7 +583,12 @@ SysTablespace::read_lsn_and_check_flags(lsn_t* flushed_lsn)
 	ut_a(it->order() == 0);
 
 	if (srv_operation  <= SRV_OPERATION_EXPORT_RESTORED) {
-		buf_dblwr.init_or_load_pages(it->handle(), it->filepath());
+		lsn_t checkpoint_lsn= 0;
+		if (log_sys.log.is_open()) {
+			checkpoint_lsn= log_sys.next_checkpoint_lsn;
+		}
+		buf_dblwr.init_or_load_pages(
+			it->handle(), it->filepath(), checkpoint_lsn);
 	}
 
 	/* Check the contents of the first page of the

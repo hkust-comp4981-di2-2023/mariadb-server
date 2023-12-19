@@ -475,6 +475,12 @@ Datafile::validate_for_recovery()
 
 		err = find_space_id();
 		if (err != DB_SUCCESS || m_space_id == 0) {
+
+			m_space_id = recv_sys.dblwr.find_first_page(
+					m_filepath, m_handle);
+
+			if (m_space_id) goto free_first_page;
+
 			ib::error() << "Datafile '" << m_filepath << "' is"
 				" corrupted. Cannot determine the space ID from"
 				" the first 64 pages.";
@@ -485,7 +491,7 @@ Datafile::validate_for_recovery()
 			m_space_id, m_filepath, m_handle)) {
 			return(DB_CORRUPTION);
 		}
-
+free_first_page:
 		/* Free the previously read first page and then re-validate. */
 		free_first_page();
 		err = validate_first_page(0);
