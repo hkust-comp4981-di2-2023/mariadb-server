@@ -44,6 +44,8 @@ void xid_cache_free(void);
 bool xid_cache_insert(XID *xid);
 bool xid_cache_insert(THD *thd, XID_STATE *xid_state, XID *xid);
 void xid_cache_delete(THD *thd, XID_STATE *xid_state);
+int32 xid_cache_get_count(THD *thd);
+void xid_cache_get_xids(THD *thd, XID *xids, int32 size);
 
 bool trans_xa_start(THD *thd);
 bool trans_xa_end(THD *thd);

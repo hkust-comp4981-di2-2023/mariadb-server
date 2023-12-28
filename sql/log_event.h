@@ -208,6 +208,7 @@ class String;
 #define USER_VAR_HEADER_LEN    0
 #define FORMAT_DESCRIPTION_HEADER_LEN (START_V3_HEADER_LEN+1+LOG_EVENT_TYPES)
 #define XID_HEADER_LEN         0
+#define XID_LIST_HEADER_LEN    4
 #define BEGIN_LOAD_QUERY_HEADER_LEN APPEND_BLOCK_HEADER_LEN
 #define ROWS_HEADER_LEN_V1     8
 #define TABLE_MAP_HEADER_LEN   8
@@ -566,8 +567,11 @@ class String;
 /* MariaDB >= 10.0.1, which knows about global transaction id events. */
 #define MARIA_SLAVE_CAPABILITY_GTID 4
 
+/* MariaDB >= 11.5.1, which knows about XID list log events*/
+#define MARIA_SLAVE_CAPABILITY_XID_LIST 5
+
 /* Our capability. */
-#define MARIA_SLAVE_CAPABILITY_MINE MARIA_SLAVE_CAPABILITY_GTID
+#define MARIA_SLAVE_CAPABILITY_MINE MARIA_SLAVE_CAPABILITY_XID_LIST
 
 
 /*
@@ -719,6 +723,13 @@ enum Log_event_type
   WRITE_ROWS_COMPRESSED_EVENT = 169,
   UPDATE_ROWS_COMPRESSED_EVENT = 170,
   DELETE_ROWS_COMPRESSED_EVENT = 171,
+
+  /*
+    XID list event. Logged at the start of every binlog with the Gtid list
+    event, to record any transactions known both to engines and prior binlogs
+    to be in a prepared state.
+  */
+  XID_LIST_EVENT= 172,
 
   /* Add new MariaDB events here - right above this comment!  */
 
@@ -1576,6 +1587,7 @@ public:
     case HEARTBEAT_LOG_EVENT:
     case BINLOG_CHECKPOINT_EVENT:
     case GTID_LIST_EVENT:
+    case XID_LIST_EVENT:
     case START_ENCRYPTION_EVENT:
       return false;
 
@@ -3678,6 +3690,86 @@ public:
 
 
 /**
+  @class List_log_event
+
+  TODO write
+*/
+template <typename T> class List_log_event: public Log_event
+{
+public:
+  uint32 l_flags;
+  uint32 count;
+  T *list;
+
+  List_log_event(uint32 flags, uint32 count, T *list): l_flags(flags), count(count), list(list) {};
+  List_log_event(const uchar *buf, uint event_len,
+                 const Format_description_log_event *description_event,
+                 Log_event_type type_code,
+                 void (*reader_func)(T *dst, const uchar *src, uint32 *read_size)
+                 );
+
+  ~List_log_event() { my_free(list); }
+
+  virtual int get_header_size()= 0;
+
+#if defined(MYSQL_SERVER) && defined(HAVE_REPLICATION)
+  bool to_packet(String *packet);
+  bool write();
+  virtual void write_element(String *packet, T *element, uint32 *size)= 0;
+#endif
+
+  inline int get_element_size()
+  {
+    return sizeof(T);
+  }
+
+  inline int get_data_size() {
+    /*
+      Replacing with dummy event, needed for older slaves, requires a minimum
+      of 6 bytes in the body.
+    */
+    return get_header_size() + (count * get_element_size());
+  }
+
+  bool is_valid() const { return list != NULL; }
+};
+
+class Xid_list_log_event : public List_log_event
+#ifdef MYSQL_SERVER
+                           <event_xid_t>
+#else
+                           <event_mysql_xid_t>
+#endif
+{
+public:
+  Xid_list_log_event(const uchar *buf, uint event_len,
+                     const Format_description_log_event *description_event);
+#if defined(MYSQL_SERVER) && defined(HAVE_REPLICATION)
+  /*
+    Construct the elements of our XID list using an active xid cache.
+
+    Note this must be done with LOG_lock (though should be guaranteed as this
+    event is only written at start of a binary log file).
+  */
+  Xid_list_log_event(THD *thd);
+
+  void write_element(String *packet, event_xid_t *element, uint32 *size);
+
+  /*
+    TODO the main logic of this can be moved to List_log_event, with a template
+    func to pack a single element (following the pattern of write_element)
+  */
+  void pack_info(Protocol *protocol);
+#endif
+#ifndef MYSQL_SERVER
+  bool print(FILE *file, PRINT_EVENT_INFO *print_event_info);
+#endif
+  Log_event_type get_type_code() { return XID_LIST_EVENT; }
+  int get_header_size() { return XID_LIST_HEADER_LEN; }
+};
+
+
+/**
   @class Gtid_list_log_event
 
   This event is logged at the start of every binlog file to record the
@@ -3745,16 +3837,13 @@ public:
   the binlog).
 */
 
-class Gtid_list_log_event: public Log_event
+class Gtid_list_log_event: public List_log_event<rpl_gtid>
 {
 public:
-  uint32 count;
-  uint32 gl_flags;
-  struct rpl_gtid *list;
   uint64 *sub_id_list;
 
   static const uint element_size= 4+4+8;
-  /* Upper bits stored in 'count'. See comment above */
+  /* Upper bits stored in List_log_event::count. See comment above */
   enum gtid_flags
   {
     FLAG_UNTIL_REACHED= (1<<28),
@@ -3771,22 +3860,13 @@ public:
 #endif
   Gtid_list_log_event(const uchar *buf, uint event_len,
                       const Format_description_log_event *description_event);
-  ~Gtid_list_log_event() { my_free(list); my_free(sub_id_list); }
+  ~Gtid_list_log_event() { my_free(sub_id_list); }
   Log_event_type get_type_code() { return GTID_LIST_EVENT; }
-  int get_data_size() {
-    /*
-      Replacing with dummy event, needed for older slaves, requires a minimum
-      of 6 bytes in the body.
-    */
-    return (count==0 ?
-            GTID_LIST_HEADER_LEN+2 : GTID_LIST_HEADER_LEN+count*element_size);
-  }
-  bool is_valid() const { return list != NULL; }
+  int get_header_size() { return GTID_LIST_HEADER_LEN; }
 #if defined(MYSQL_SERVER) && defined(HAVE_REPLICATION)
-  bool to_packet(String *packet);
-  bool write();
   virtual int do_apply_event(rpl_group_info *rgi);
   enum_skip_reason do_shall_skip(rpl_group_info *rgi);
+  void write_element(String *packet, rpl_gtid *element, uint32 *size);
 #endif
   static bool peek(const char *event_start, size_t event_len,
                    enum enum_binlog_checksum_alg checksum_alg,

@@ -343,13 +343,48 @@ static my_bool xid_cache_iterate_callback(XID_cache_element *element,
   return res;
 }
 
-static int xid_cache_iterate(THD *thd, my_hash_walk_action action, void *arg)
+int xid_cache_iterate(THD *thd, my_hash_walk_action action, void *arg)
 {
   xid_cache_iterate_arg argument= { action, arg };
   return thd->fix_xid_hash_pins() ? -1 :
          lf_hash_iterate(&xid_cache, thd->xid_hash_pins,
                          (my_hash_walk_action) xid_cache_iterate_callback,
                          &argument);
+}
+
+int32 xid_cache_get_count(THD *thd)
+{
+  return xid_cache.count;
+}
+
+/**
+  Each element in the xid_cache saves itself into the `xid_list` of this
+  element into increasing index `i`.
+*/
+struct xid_cache_save_xids_arg
+{
+  int32 i;
+  int32 size;
+  XID *xid_list;
+};
+
+static my_bool
+xid_cache_save_element(XID_cache_element *xs,
+                       struct xid_cache_save_xids_arg *xid_list_builder)
+{
+  int32 i= xid_list_builder->i;
+  xid_list_builder->xid_list[i].set(&xs->xid);
+  xid_list_builder->i++;
+  return FALSE;
+}
+
+
+void xid_cache_get_xids(THD *thd, XID *xids, int32 size)
+{
+  DBUG_ASSERT(size == xid_cache.count);
+  struct xid_cache_save_xids_arg xid_list_builder= {0, size, xids};
+  xid_cache_iterate(thd, (my_hash_walk_action) xid_cache_save_element, &xid_list_builder);
+  return;
 }
 
 

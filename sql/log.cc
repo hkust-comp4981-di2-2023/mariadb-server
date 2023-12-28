@@ -3898,6 +3898,10 @@ bool MYSQL_BIN_LOG::open(const char *log_name,
         if (write_event(&gl_ev))
           goto err;
 
+        Xid_list_log_event xl_ev(current_thd);
+        if (write_event(&xl_ev))
+          goto err;
+
         /* Output a binlog checkpoint event at the start of the binlog file. */
 
         /*

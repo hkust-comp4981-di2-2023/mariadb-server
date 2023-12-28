@@ -3618,10 +3618,54 @@ Gtid_log_event::do_shall_skip(rpl_group_info *rgi)
 #endif  /* HAVE_REPLICATION */
 
 
+template <typename T> bool List_log_event<T>::to_packet(String *packet)
+{
+  uint32 i;
+  uchar *p;
+  uint32 needed_length;
+
+  DBUG_ASSERT(count < 1<<28);
+
+  needed_length= packet->length() + get_data_size();
+  if (packet->reserve(needed_length))
+    return true;
+  p= (uchar *)packet->ptr() + packet->length();;
+  packet->length(needed_length);
+  int4store(p, (count & ((1<<28)-1)) | l_flags);
+  p += 4;
+  /* Initialise the padding for empty list. */
+  if (count == 0)
+  {
+    int2store(p, 0);
+    p+= 2;
+  }
+  for (i= 0; i < count; ++i)
+  {
+    uint32 out= 0;
+    write_element(packet, &list[i], &out);
+    p+= out;
+  }
+
+  return false;
+}
+
+template <typename T> bool List_log_event<T>::write()
+{
+  char buf[128];
+  String packet(buf, sizeof(buf), system_charset_info);
+
+  packet.length(0);
+  if (to_packet(&packet))
+    return true;
+  return write_header(get_data_size()) ||
+         write_data(packet.ptr(), packet.length()) ||
+         write_footer();
+}
+
 
 Gtid_list_log_event::Gtid_list_log_event(rpl_binlog_state *gtid_set,
                                          uint32 gl_flags_)
-  : count(gtid_set->count()), gl_flags(gl_flags_), list(0), sub_id_list(0)
+    : List_log_event(gl_flags_, gtid_set->count(), 0), sub_id_list(0)
 {
   cache_type= EVENT_NO_CACHE;
   /* Failure to allocate memory will be caught by is_valid() returning false. */
@@ -3634,7 +3678,7 @@ Gtid_list_log_event::Gtid_list_log_event(rpl_binlog_state *gtid_set,
 
 Gtid_list_log_event::Gtid_list_log_event(slave_connection_state *gtid_set,
                                          uint32 gl_flags_)
-  : count(gtid_set->count()), gl_flags(gl_flags_), list(0), sub_id_list(0)
+    : List_log_event(gl_flags_, gtid_set->count(), 0), sub_id_list(0)
 {
   cache_type= EVENT_NO_CACHE;
   /* Failure to allocate memory will be caught by is_valid() returning false. */
@@ -3644,7 +3688,7 @@ Gtid_list_log_event::Gtid_list_log_event(slave_connection_state *gtid_set,
   {
     gtid_set->get_gtid_list(list, count);
 #if defined(HAVE_REPLICATION)
-    if (gl_flags & FLAG_IGN_GTIDS)
+    if (l_flags & FLAG_IGN_GTIDS)
     {
       uint32 i;
 
@@ -3674,58 +3718,21 @@ Gtid_list_log_event::Gtid_list_log_event(slave_connection_state *gtid_set,
 
 
 #if defined(HAVE_REPLICATION)
-bool
-Gtid_list_log_event::to_packet(String *packet)
+void Gtid_list_log_event::write_element(String *packet, rpl_gtid *element,
+                                        uint32 *size)
 {
-  uint32 i;
-  uchar *p;
-  uint32 needed_length;
-
-  DBUG_ASSERT(count < 1<<28);
-
-  needed_length= packet->length() + get_data_size();
-  if (packet->reserve(needed_length))
-    return true;
-  p= (uchar *)packet->ptr() + packet->length();;
-  packet->length(needed_length);
-  int4store(p, (count & ((1<<28)-1)) | gl_flags);
-  p += 4;
-  /* Initialise the padding for empty Gtid_list. */
-  if (count == 0)
-    int2store(p, 0);
-  for (i= 0; i < count; ++i)
-  {
-    int4store(p, list[i].domain_id);
-    int4store(p+4, list[i].server_id);
-    int8store(p+8, list[i].seq_no);
-    p += 16;
-  }
-
-  return false;
+  int4store(packet, element->domain_id);
+  int4store(packet + 4, element->server_id);
+  int8store(packet + 8, element->seq_no);
+  *size+= 16;
 }
-
-
-bool
-Gtid_list_log_event::write()
-{
-  char buf[128];
-  String packet(buf, sizeof(buf), system_charset_info);
-
-  packet.length(0);
-  if (to_packet(&packet))
-    return true;
-  return write_header(get_data_size()) ||
-         write_data(packet.ptr(), packet.length()) ||
-         write_footer();
-}
-
 
 int
 Gtid_list_log_event::do_apply_event(rpl_group_info *rgi)
 {
   Relay_log_info *rli= const_cast<Relay_log_info*>(rgi->rli);
   int ret;
-  if (gl_flags & FLAG_IGN_GTIDS)
+  if (l_flags & FLAG_IGN_GTIDS)
   {
     void *hton= NULL;
     uint32 i;
@@ -3742,7 +3749,7 @@ Gtid_list_log_event::do_apply_event(rpl_group_info *rgi)
   }
   ret= Log_event::do_apply_event(rgi);
   if (rli->until_condition == Relay_log_info::UNTIL_GTID &&
-      (gl_flags & FLAG_UNTIL_REACHED))
+      (l_flags & FLAG_UNTIL_REACHED))
   {
     char str_buf[128];
     String str(str_buf, sizeof(str_buf), system_charset_info);
@@ -3780,6 +3787,69 @@ Gtid_list_log_event::pack_info(Protocol *protocol)
   first= true;
   for (i= 0; i < count; ++i)
     rpl_slave_state_tostring_helper(&buf, &list[i], &first);
+  buf.append(STRING_WITH_LEN("]"));
+
+  protocol->store(&buf);
+}
+
+
+Xid_list_log_event::Xid_list_log_event(THD *thd)
+    : List_log_event(0, xid_cache_get_count(thd), (event_xid_t *) NULL)
+{
+  cache_type= EVENT_NO_CACHE;
+
+  if (count >= (1<<28))
+    return;
+
+  /* Failure to allocate memory will be caught by is_valid() returning false. */
+  if (!(list= (event_xid_t *) my_malloc(PSI_INSTRUMENT_ME,
+                                     count ? count * get_element_size() : 1,
+                                     MYF(MY_WME))))
+    return;
+
+  if (count)
+    xid_cache_get_xids(thd, list, count);
+}
+
+
+void Xid_list_log_event::write_element(String *packet, event_xid_t *element,
+                                       uint32 *size)
+{
+  int4store(packet, element->formatID);
+  *size+= 4;
+  int4store(packet, element->gtrid_length);
+  *size+= 4;
+  int4store(packet, element->bqual_length);
+  *size+= 4;
+  long data_length= element->bqual_length + element->gtrid_length;
+  memcpy(packet, element->data, data_length);
+  *size+= data_length;
+}
+
+
+void
+Xid_list_log_event::pack_info(Protocol *protocol)
+{
+  char buf_mem[1024];
+  String buf(buf_mem, sizeof(buf_mem), system_charset_info);
+  uint32 i;
+  char delim= '\0';
+
+  buf.length(0);
+  buf.append(STRING_WITH_LEN("["));
+  for (i= 0; i < count; ++i)
+  {
+    buf.append(delim);
+
+    /*
+      TODO Optimize with serialize method of event_xid_t that appends to a
+      String object
+    */
+    list[i].serialize();
+    buf.append(list[i].buf, list[i].key_length());
+
+    delim= ',';
+  }
   buf.append(STRING_WITH_LEN("]"));
 
   protocol->store(&buf);

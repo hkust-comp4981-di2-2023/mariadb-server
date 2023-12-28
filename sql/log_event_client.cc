@@ -2327,6 +2327,40 @@ err:
   return 1;
 }
 
+/*
+  TODO the internals of this still need to be written. Likely to be abstracted
+  into List_log_event, with a template print_element() method.
+*/
+bool
+Xid_list_log_event::print(FILE *file, PRINT_EVENT_INFO *print_event_info)
+{
+  if (print_event_info->short_form)
+    return 0;
+
+  Write_on_release_cache cache(&print_event_info->head_cache, file,
+                               Write_on_release_cache::FLUSH_F);
+  if (print_header(&cache, print_event_info, FALSE) ||
+      my_b_printf(&cache, "\tXid list ["))
+    goto err;
+
+  for (i= 0; i < count; ++i)
+  {
+
+    /*
+      TODO move to List_log_event::print() and create
+           Xid_list_log_event::print_element()
+    */
+    if (i < count-1)
+      if (my_b_printf(&cache, ",\n# "))
+        goto err;
+  }
+  if (my_b_printf(&cache, "]\n"))
+    goto err;
+
+  return cache.flush_data();
+err:
+  return 1;
+}
 
 bool Intvar_log_event::print(FILE* file, PRINT_EVENT_INFO* print_event_info)
 {
