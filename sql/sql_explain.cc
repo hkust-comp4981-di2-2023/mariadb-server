@@ -2087,7 +2087,7 @@ void Explain_table_access::print_explain_json(Explain_query *query,
       r_index_rows is the number of rows enumerated in the index before
       any kind of checking. The number is the average across all scans.
     */
-    double loops= tracker.get_loops();
+    double loops= rows2double(tracker.get_loops());
     if (!loops)
       loops= 1.0;
     handler *file= handler_for_stats;
