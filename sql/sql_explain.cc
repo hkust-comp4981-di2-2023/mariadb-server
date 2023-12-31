@@ -2098,7 +2098,7 @@ void Explain_table_access::print_explain_json(Explain_query *query,
         Pushed Index Condition is checked before checking the Rowid Filter, 
         so try getting it first.
       */
-      r_index_rows= (double)file->handler_stats->icp_attempts / loops;
+      r_index_rows= file->handler_stats->icp_attempts / loops;
       have_icp_or_rowid_filter= true;
     }
     else if (rowid_filter)
